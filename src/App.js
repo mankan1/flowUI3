@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react'; 
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'; 
 import { TrendingUp, TrendingDown, Zap, Activity, AlertCircle, BarChart3, Filter, Play, Pause, RefreshCw } from 'lucide-react';
 
 const OptionsFlowClient = () => {
@@ -19,22 +19,13 @@ const OptionsFlowClient = () => {
     stance: 'all' 
   });
   const [isPaused, setIsPaused] = useState(false);
-  const [autoScroll, setAutoScroll] = useState(true);
   
   const wsRef = useRef(null);
-  const streamEndRef = useRef(null);
 
   const streamCount = trades.length;
   const printCount = prints.length;
   const quoteCount = Object.keys(quotes).length;
   const autoCount = autoTrades.length;
-
-  // Auto-scroll effect
-  useEffect(() => {
-    if (autoScroll && streamEndRef.current) {
-      streamEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [trades, autoScroll]);
 
   const connectWebSocket = useCallback(() => {
     const ws = new WebSocket('ws://localhost:3000/ws');
@@ -218,6 +209,17 @@ const OptionsFlowClient = () => {
     return true;
   });
 
+  // 🔼 Sort filtered trades by highest premium (amount) first, then newest
+  const sortedTrades = [...filteredTrades].sort((a, b) => {
+    const pa = a.premium || 0;
+    const pb = b.premium || 0;
+    if (pb !== pa) return pb - pa;
+
+    const ta = a.timestamp || a.receivedAt || 0;
+    const tb = b.timestamp || b.receivedAt || 0;
+    return tb - ta;
+  });
+
   const getCurrentULPrice = (ulConid) => {
     const ulQuote = ulQuotes[ulConid];
     return ulQuote ? ulQuote.last : 0;
@@ -242,6 +244,80 @@ const OptionsFlowClient = () => {
     setUlQuotes({});
     setAutoTrades([]);
   };
+
+  /* ========= CUMULATIVE DELTA SCORE LOGIC ========= */
+
+  // Per-trade delta contribution based on BTO/BTC vs STO/STC
+  const getDeltaContribution = (trade) => {
+    const delta = trade.greeks?.delta;
+    if (typeof delta !== 'number') return 0;
+
+    const size = trade.size || 1;
+
+    // Treat buys (BTO/BTC) as +, sells (STO/STC) as -
+    let dirSign = 0;
+    if (trade.direction === 'BTO' || trade.direction === 'BTC') dirSign = 1;
+    else if (trade.direction === 'STO' || trade.direction === 'STC') dirSign = -1;
+    else return 0;
+
+    // Score is delta * contracts * sign
+    return delta * size * dirSign;
+  };
+
+  const { symbolScores, totalScore } = useMemo(() => {
+    const scores = {};
+    let total = 0;
+
+    for (const t of trades) {
+      if (!t.symbol) continue;
+      const contrib = getDeltaContribution(t);
+      if (!contrib) continue;
+
+      scores[t.symbol] = (scores[t.symbol] || 0) + contrib;
+      total += contrib;
+    }
+
+    return { symbolScores: scores, totalScore: total };
+  }, [trades]);
+
+  const sortedSymbolScores = useMemo(() => {
+    return Object.entries(symbolScores).sort(
+      (a, b) => Math.abs(b[1]) - Math.abs(a[1])
+    );
+  }, [symbolScores]);
+
+  const getFlowSentiment = (score) => {
+    const threshold = 0.5; // small deadzone; tweak if you want
+    if (score > threshold) return 'BULL';
+    if (score < -threshold) return 'BEAR';
+    return 'NEUTRAL';
+  };
+
+  const overallSentiment = getFlowSentiment(totalScore);
+
+  const sentimentStyles = (() => {
+    if (overallSentiment === 'BULL') {
+      return {
+        label: 'BULL',
+        icon: <TrendingUp className="w-4 h-4 text-green-400" />,
+        chip: 'bg-green-900/40 border-green-500 text-green-300'
+      };
+    }
+    if (overallSentiment === 'BEAR') {
+      return {
+        label: 'BEAR',
+        icon: <TrendingDown className="w-4 h-4 text-red-400" />,
+        chip: 'bg-red-900/40 border-red-500 text-red-300'
+      };
+    }
+    return {
+      label: 'NEUTRAL',
+      icon: <Activity className="w-4 h-4 text-yellow-400" />,
+      chip: 'bg-yellow-900/40 border-yellow-500 text-yellow-300'
+    };
+  })();
+
+  /* ================================================ */
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 p-4">
@@ -275,8 +351,56 @@ const OptionsFlowClient = () => {
           </div>
         </div>
         
-        <div className="text-sm text-gray-400 mb-4">
+        <div className="text-sm text-gray-400 mb-2">
           Connected to IBKR Flow (Equities + Futures) - 25 ATM, ~15 DTE with live quotes, prints & BTO/STO/BTC/STC
+        </div>
+
+        {/* 🔥 Flow Sentiment & Symbol Delta Scores */}
+        <div className="mb-4 space-y-2">
+          <div className="flex items-center gap-3 flex-wrap">
+            <div className={`flex items-center gap-2 px-3 py-2 rounded-full border ${sentimentStyles.chip}`}>
+              {sentimentStyles.icon}
+              <span className="text-xs uppercase tracking-wide font-semibold">
+                Overall Flow: {sentimentStyles.label}
+              </span>
+              <span className="text-xs font-mono text-gray-200">
+                {totalScore >= 0 ? '+' : ''}{totalScore.toFixed(1)} Δ
+              </span>
+            </div>
+
+            <span className="text-xs text-gray-500">
+              Score = Σ(delta × contracts × sign(BTO/BTC vs STO/STC))
+            </span>
+          </div>
+
+          {sortedSymbolScores.length > 0 && (
+            <div className="flex gap-2 overflow-x-auto pb-1">
+              {sortedSymbolScores.map(([sym, score]) => {
+                const symSentiment = getFlowSentiment(score);
+                const color =
+                  symSentiment === 'BULL'
+                    ? 'text-green-300 border-green-600 bg-green-900/30'
+                    : symSentiment === 'BEAR'
+                    ? 'text-red-300 border-red-600 bg-red-900/30'
+                    : 'text-yellow-300 border-yellow-600 bg-yellow-900/20';
+
+                return (
+                  <div
+                    key={sym}
+                    className={`flex items-center gap-2 px-3 py-1 rounded-full border text-xs whitespace-nowrap ${color}`}
+                  >
+                    <span className="font-semibold">{sym}</span>
+                    <span className="font-mono">
+                      {score >= 0 ? '+' : ''}{score.toFixed(1)}Δ
+                    </span>
+                    <span className="uppercase text-[10px] opacity-80">
+                      {symSentiment}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* Symbol Buttons */}
@@ -322,15 +446,7 @@ const OptionsFlowClient = () => {
             />
             <span className="text-sm">Pause</span>
           </label>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input 
-              type="checkbox" 
-              className="w-4 h-4" 
-              checked={autoScroll}
-              onChange={() => setAutoScroll(!autoScroll)}
-            />
-            <span className="text-sm">Auto-scroll</span>
-          </label>
+          {/* Auto-scroll removed */}
         </div>
 
         {/* Tabs */}
@@ -416,7 +532,7 @@ const OptionsFlowClient = () => {
       {/* Content */}
       {(activeTab === 'stream' || activeTab === 'trades') && (
         <div className="space-y-3">
-          {filteredTrades.map((trade, idx) => {
+          {sortedTrades.map((trade, idx) => {
             const ulMapping = getMapping(trade.underlyingConid);
             const currentULPrice = getCurrentULPrice(trade.underlyingConid);
             const ulPriceChange = currentULPrice && trade.underlyingPrice 
@@ -594,13 +710,11 @@ const OptionsFlowClient = () => {
             );
           })}
           
-          {filteredTrades.length === 0 && (
+          {sortedTrades.length === 0 && (
             <div className="text-center py-12 text-gray-500">
               No trades yet. Waiting for options flow...
             </div>
           )}
-          
-          <div ref={streamEndRef} />
         </div>
       )}
 
